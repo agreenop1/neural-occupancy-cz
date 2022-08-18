@@ -27,6 +27,7 @@ inv_logit_vec = np.vectorize(inv_logit)
 def logit(p):
     return float (sy.log(p)- sy.log(1 -p))
 #################################################################################
+#
 # covariate effect
 cov1 = 0.2
 cov2 = -0.7
@@ -271,15 +272,22 @@ def gradient(theta, X, y):
 #######################################################################
 ############### occupancy neural model ################################
 #######################################################################
-nsites = 400
+nsites = 500
 nyears = 20
 nsurvy = 2
 nobs = nsites * nsurvy * nyears
 k = 20
-phix = torch.distributions.uniform.Uniform(low=-torch.ones(nyears), high=torch.ones(nyears)).sample()
 
+
+# occupancy transition
+phix = torch.distributions.uniform.Uniform(low=-torch.ones(nyears), high=torch.ones(nyears)).sample()
+psi = torch.distributions.uniform.Uniform(low=-torch.ones(nyears), high=torch.ones(nyears)).sample()
+
+# observation covariate
 obsx = torch.distributions.uniform.Uniform(low=-torch.ones(nobs), high=torch.ones(nobs)).sample()
-obsx_ten = obsx.view(400,20,2) # site, year, visit
+obsx_ten = obsx.view(nsites,20,2) # site, year, visit
+
+# initial occupancy301
 
 psi0x = torch.distributions.uniform.Uniform(low=-torch.ones(nsites), high=torch.ones(nsites)).sample()
 #x, _ = torch.sort(x) # sort variable from lowest to highest
@@ -291,15 +299,69 @@ phix, obsx, psi0x = phix.unsqueeze(1),obsx.unsqueeze(1),psi0x.unsqueeze(1)
 
 # create the dataframe
 cv1,cv2,cv3,cv4,cv5,cv6 = 0.5,-0.1,0.8,0.5,-0.2,-0.05 # coefficients
-phiy = torch.sigmoid(cv1 + cv2 * phix  + cv3 * phix **2-1) # observation
 
+# predict persistence
+phiy = torch.sigmoid(cv1 + cv2 * phix  + cv3 * phix **2-1)
+psi_year = cv1 + -0.9* phix  + 0.09* phix **2
+# predict colonization
 gamy = torch.sigmoid(cv1 + -0.5*cv2 * phix  + -0.5*cv3 * phix **2 + -0.5*cv3 * phix **3+1)
 
+# predict observation model
 py = torch.sigmoid(cv4 + cv5 * obsx + cv6 * obsx**2) # observation
-py_arr = py.view(400,20,2) # site, year, visit
+py_arr = py.view(nsites,20,2) # site, year, visit
 
-psi0y = torch.sigmoid(cv4 + 0.7 * psi0x + 0.7 * psi0x**2) # occupancy
+# predict initial occupancy
+psi0y = torch.sigmoid(cv4 + 0.07 * psi0x + 0.07 * psi0x**2) # occupancy
 
+# non dynamic model
+psi_sites =  0.7 * psi0x + 0.7 * psi0x**2 # occupancy
+
+#########################################
+# predict occupancy for non dynamic model
+zs = torch.zeros((nsites,nyears))
+psis = torch.zeros((nsites,nyears))
+psis[:,0] = torch.sigmoid(psi_year[0].squeeze() + psi_sites[:,0].squeeze())
+zs[:, 0] = torch.distributions.Bernoulli(probs=psis[:, 0]).sample().squeeze()
+for i in range(1,nyears):
+    psis[:,i] = torch.sigmoid(psi_year[i,0].squeeze() + psi_sites[:,0].squeeze())
+    zs[:,i] = torch.distributions.Bernoulli(probs = psis[:,i] ).sample().squeeze()
+
+
+# observed p/a
+yobss = torch.zeros((nobs,7))
+
+obs_ys = torch.zeros((nsites,nyears,nsurvy))
+
+# if observation is missing use 0 as the covariate - careful centering!
+
+# observed occupancy
+for j in range(0, nsites):
+    for i in range(0,nyears):
+        for n in range(0,nsurvy):
+            z_ix = torch.distributions.Bernoulli(probs=zs[j,i]*py_arr[j,i,n]).sample()
+            obs_ys[j,i,n] = z_ix
+
+psi_sites_x = psi0x.repeat_interleave(nyears)
+psi_year_x = phix.repeat(nsites,1).squeeze()
+
+site_id = torch.range(0,nsites-1).repeat_interleave(nyears)
+year_id = torch.range(0,nyears-1).repeat(nsites)
+
+# covariates for neural occupancy model
+site_covariates = torch.hstack((psi_sites_x.unsqueeze(1),
+        site_id.unsqueeze(1),
+        psi_year_x.unsqueeze(1),
+        year_id.unsqueeze(1)))
+
+i=1
+j=2
+
+# test it will work in the model
+sxi = site_covariates[site_covariates[:,1]==i,:]
+sxi = sxi[sxi[:,3]==j,(0,2)]
+#########################################
+#
+# set up occupancies for dynamic model
 # init occupancy z frame
 z = torch.zeros((nsites,nyears))
 psi = torch.zeros((nsites,nyears))
@@ -317,7 +379,7 @@ for t in range(1, nyears):
 psi.mean(0)
 # observed p/a
 yobs = torch.zeros((nobs,7))
-site_id = torch.range(0,399)
+site_id = torch.range(0,nsites-1)
 vis_id = torch.range(0,1)
 year_id = torch.range(0,19)
 
@@ -333,366 +395,187 @@ for j in range(0, nsites):
             z_ix = torch.distributions.Bernoulli(probs=z[j,i]*py_arr[j,i,n]).sample()
             obs_y[j,i,n] = z_ix
 
-# visualize relationship
+#########################################
+# visualize relationships between covariates and predict variable
 
-plt.scatter(phix.numpy(), phiy.numpy(), color='r')
+plt.plot(torch.range(1,20), phix.numpy(), color='r')
 plt.scatter(phix.numpy(), gamy.numpy(), color='b')
 plt.scatter(psi0x.numpy(), psi0y.numpy(), color='b')
 plt.scatter(obsx.numpy(), py.numpy(), color='b')
 plt.scatter(torch.range(1,20), psi.mean(0).numpy(), color='b')
-plt.plot(torch.range(1,20), psi.mean(0).numpy(), color='b')
+plt.scatter(torch.range(1,20), psis.mean(0).numpy(), color='b')
+plt.plot(torch.range(1,20), psis.mean(0).numpy(), color='b')
 plt.title('Occupancy probabilities')
 plt.show()
 
 device = "cuda:0" #torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
 # define neural network ###################################################################
-
-
-class Net(nn.Module):
+#########################################
+# non dynamic neural network
+class Net1(nn.Module):
 
     n_p_cov = 1
-    n_psi_cov = 1
+    n_psi_cov = 2
     h_dim = 64
     nyears = 20
     nvis = 2
-    def __init__(self):
-        super(Net, self).__init__()
+    nsites = nsites
 
-        # hidden p, gam, phi
-        self.to_h = nn.Linear(1, self.h_dim)
-        self.to_hpsi0 = nn.Linear(1, self.h_dim)
+    def __init__(self):
+        super(Net1, self).__init__()
+
+        # one hidden layer
+        self.to_h = nn.Linear(self.n_psi_cov, self.h_dim)
 
         # component
-        self.to_phi = nn.Linear(self.h_dim, 1)
-        self.to_psi0 = nn.Linear(self.h_dim, 1)
-        self.to_gam = nn.Linear(self.h_dim, 1)
+        self.to_psi = nn.Linear(self.h_dim, 1)
         self.to_p = nn.Linear(self.h_dim+self.n_p_cov, 1)
 
-    def forward(self,sxy,sx0 ,oxy,hx,p):
-
-        # set up list for outputs
-        phi = list()
-        gam = list()
-
-
+    def forward(self,sxy ,oxy,p):
         # neural net
-        for i in range(0,self.nyears-1):
-            hx[i,:] = F.elu(self.to_h(sxy[i]))
+        h_out = F.elu(self.to_h(sxy))
+        psi_out = torch.sigmoid(self.to_psi(h_out))
 
-        # initial occupancy
-        hx0 = F.elu(self.to_hpsi0(sx0))
-        psi0 = torch.sigmoid( self.to_psi0(hx0))
-
-        # phi and gam
-        for i in range(0, self.nyears - 1):
-            phi.append( torch.sigmoid( self.to_phi(hx[i,:])))
-            gam.append( torch.sigmoid( self.to_gam(hx[i,:])))
-
-
+        c = -1
         # observation
-        for i in range(0, self.nyears):
+        for s in oxy:
+            oxy_i = s[0,:,:]
+            c += 1
+            for i in range(0, self.nyears):
+                hix = h_out[i,:].clone()
+                hx_x =  hix.unsqueeze(0)
+                hx_xy = hx_x[0, :]
 
-            if i == 0:
-                hx_x = hx0.squeeze()
-            else:
-                hx_x =  hx[i-1,:].unsqueeze(0)
-                hx_x = hx_x[0, :]
+                for j in range(0, self.nvis):
+                    x = oxy_i[i,j]
+                    tc = torch.cat((hx_xy, x.unsqueeze(0)))
+                    p[c,i,j] = torch.sigmoid(self.to_p(tc))
 
-            for j in range(0, self.nvis):
-                x = oxy[i,j]
-                tc = torch.cat((hx_x, x.unsqueeze(0)))
-                p[i,j] = torch.sigmoid(self.to_p(tc))
-        return psi0,phi,gam,p
+        return psi_out,p
 
-net1 = Net()
-net1.to(device)
-
+net_static = Net1()
+net_static.to(device)
 
 ############################################################################################
 # send to co
 # res
 running_loss = list()
 
-
-optimizer = optim.Adam(net1.parameters(), weight_decay=1e-8)
+# currently set up for static model
+optimizer = optim.Adam(net_static.parameters(), weight_decay=1e-8,lr=0.001)
 n_epoch = 100
 
 # needs to put data somewhere
 __file__ = 'C:\\Users\\arrgre\\PycharmProjects\\pythonProject\\neural'
 # 32 samples loaded into train
 # parameters
-params = {'batch_size': 100,
+params = {'batch_size':50,
           'shuffle': True,
           'num_workers': 1}
 
-
+batch = 50
 dataset = TensorDataset(site_id.unsqueeze(1))
 dataloader = DataLoader(dataset, **params)
 dataloader
 
+#############################################################################
+# set up for static model
 
-
-# test neural occupancy ##########################################################
-for i_batch, xy in enumerate(dataloader):
-    xy = xy[0]
-    # load a minibatch
-    for i in xy.long():
-        s = i
+for i in tqdm(range(n_epoch)): # counter
+    for i_batch, xy in enumerate(dataloader):
+        xy = xy[0]
+        id = xy.long()
 
         # subset data for example
-        oxy = obsx_ten[i,:,:].to(device)
-        y_i = obs_y[i, :, :].to(device)
-        sx0 = psi0x[s].to(device)
-        sxy = phix.to(device)
+        oxy = obsx_ten[id, :, :].to(device)
+        y_i = obs_ys[id, :, :].to(device)
+        y_i.size()
+        # occupancy covariates
+        b = torch.isin(site_covariates[:, 1],id)
+        sxy = site_covariates[b,]
+        sxy = sxy.to(device)
 
         # test effects of missing data
-        y_i[0,1,0:2] =  -10**6
-        miss_data = y_i == -10**6
-        no_surveys = torch.Tensor.sum( y_i,-1) < 0
+        miss = torch.randint(0,19,(5,)).long()
+        y_i[:,0,miss, 0:2] = float('nan')
+        miss_data = torch.isnan(y_i)
+        no_surveys = torch.Tensor.sum(miss_data, -1) == nsurvy
         oxy[miss_data] = 0
         y_i[miss_data] = 0
 
-        # zero out the gradients
-        optimizer.zero_grad()
+        # occupancy covariates
+        b = torch.isin(site_covariates[:, 1],id)
+        sxy = site_covariates[b,]
+        sxy = sxy.to(device)
 
-        # neural net
-        hx = torch.zeros(nyears - 1, 64).to(device)
-        p = torch.zeros(nyears,nsurvy).to(device)
-        net_out = net1(sxy, sx0, oxy[0,:,:], hx, p)
-
-        # outputs
-        psi0 = net_out[0]
-        phi = torch.cat(net_out[1])
-        gam = torch.cat(net_out[2])
-        p  = net_out[3]
-
-        psize = p.size()
-        # list for outputs likelihoods
-        plik = torch.zeros((1,psize[0],psize[1]))
-        plik = plik.to(device)
-
-        # start with likelihood for observations
-        with torch.autograd.detect_anomaly():
-            for i in range(0, nyears):
-                for j in range(0, nsurvy):
-                    plik[0,i,j] = p[i,j]**y_i[0,i,j]  * ((1-p[i,j])**(1-y_i[0,i,j] ))
-
-        # missing values dont impact likelihood
-        plik[miss_data] = 1
-        lp_y_present = torch.log(torch.Tensor.prod(plik,-1)) # log likelihood
-
-        no = torch.Tensor.sum(y_i,-1)==0
-
-        # look at examples with no species
-        po = torch.stack((torch.exp(lp_y_present),no.to(device, dtype=torch.float64),),-1,)
-        po
-
-        # iterate over training examples and replace po with 2x2 identity matrix
-        # when no surveys are conducted
-        po[no_surveys, :] = torch.ones(2,dtype=torch.float64).to(device)
-        assert torch.sum(torch.isnan(po)) < 1
-
-        # START HERE #
-        phi_0_i = torch.cat((out["psi0"], 1 - out["psi0"]), -1)
-        Omega = torch.stack(
-            (
-                torch.stack((out["phi"], 1 - out["phi"]), -1),
-                torch.stack((out["gamma"], 1 - out["gamma"]), -1),
-            ),
-            -2,  # stacking along rows (so that rows probs to one)
-        )
-        assert Omega.shape == (batch_size, num_years - 1, 2, 2)
-
-
-        # initial occupancy
-        phi_0_j = torch.cat((psi0, 1 - psi0), -1)
-
-        # colonization and extinction
-        Omega = torch.stack((torch.stack((phi, 1 - phi), -1),
-                             torch.stack((gam, 1 - gam), -1)),
-                            -2)  # dims: (batch_size, nt-1, 2, 2)
-        assert Omega.shape == (batch_size, nt - 1, 2, 2)
-
-        c = list()
-        alpha_raw = torch.mm(phi_0_j.unsqueeze(1),
-                              torch.diag_embed(po[ 0, :], dim1=-2, dim2=-1)
-                              )
-        for t in range(nt - 1):
-            alpha_raw = torch.bmm(alpha,
-                                  torch.bmm(
-                                      Omega[:, t, :, :],
-                                      # batch diagonal
-                                      torch.diag_embed(po[:, t + 1, :], dim1=-2, dim2=-1),
-                                  )
-                                  )
-            c.append((torch.ones(batch_size, 1).to(device) / torch.sum(alpha_raw, dim=-1)).squeeze())
-            alpha = c[-1].view(-1, 1, 1) * alpha_raw
-        c_stacked = torch.stack(c, -1)
-
-    # determine for each example whether we know if z = 1
-    definitely_present = (y_i > 0).to(device, dtype=torch.float32)
-    maybe_absent = (y_i == 0).to(device, dtype=torch.float32)
-#
-    # generate estimates of psi and p from the model
-    psi_i, p_i = net1(x_i, x_i)
-
-    # compute the loss (negative log likelihood) currently for binomial
-    y_dist_if_present = torch.distributions.binomial.Binomial(total_count=k, probs=p_i)
-    lp_present = torch.log(psi_i) + y_dist_if_present.log_prob(y_i) # log likelihood observed and present
-    my_abs_l = torch.cat((lp_present, torch.log(1 - psi_i)), dim=1)
-    lp_maybe_absent = torch.logsumexp( my_abs_l, dim=1) # log probability if absent
-    log_prob = definitely_present * lp_present + maybe_absent * lp_maybe_absent # log probability
-
-
-    loss = -torch.mean(log_prob) # loss function
-    loss.backward()
-    optimizer.step()
-    running_loss.append(loss.cpu().data.numpy())
-######################################################################################################
-
-# train model
-for i in tqdm(range(n_epoch)): # counter
-    for i_batch, xy in enumerate(dataloader):
-        # load a minibatch
-        x_i, y_i = xy
-        x_i = x_i.to(device)
-        y_i = y_i.to(device)
-
-        # zero out the gradients
         optimizer.zero_grad()
 
         # determine for each example whether we know if z = 1
-        definitely_present = (y_i > 0).to(device, dtype=torch.float32)
-        maybe_absent = (y_i == 0).to(device, dtype=torch.float32)
+        definitely_present = (torch.Tensor.sum(y_i,-1) > 0).to(device, dtype=torch.float32)
+        maybe_absent = (torch.Tensor.sum(y_i,-1) == 0).to(device, dtype=torch.float32)
 
-        # generate estimates of psi and p from the model
-        psi_i, p_i = net1(x_i,x_i)
 
+
+        # neural net
+        p = torch.zeros(batch,nyears, nsurvy).to(device)
+
+        net_out = net_static(sxy[:,(0,2)],  oxy,  p)
+
+        # neural network outputs
+        p = net_out[1]
+        psi = net_out[0]
+
+
+        # list for outputs likelihoods
+        psize = p.size()
+        plik = torch.zeros((batch,1, nyears, nsurvy))
+        plik = plik.to(device)
+
+        for s in range(0,batch):
+                for k in range(0, nyears):
+                    for j in range(0, nsurvy):
+                        plik[s, 0,k, j] = p[s,k, j] ** y_i[s,0 ,k, j] * ((1 - p[s,k, j]) ** (1 - y_i[s,0, k, j]))
+
+        plik[miss_data] = 1
+        lp_y_present = torch.log(torch.Tensor.prod(plik, -1))  # log likelihood
+
+        d1 = batch * nyears
         # compute the loss (negative log likelihood)
-        y_dist_if_present = torch.distributions.binomial.Binomial(total_count=k, probs=p_i)
-        lp_present = torch.log(psi_i) + y_dist_if_present.log_prob(y_i) # likelihood of y * probability of present
-        lp_maybe_absent = torch.logsumexp(torch.cat((lp_present, torch.log(1 - psi_i)), dim=1),
-                                          dim=1)
-        log_prob = definitely_present * lp_present + maybe_absent * lp_maybe_absent
+        lp_present = torch.log(psi.squeeze()) + lp_y_present.view(d1)
+        mal = torch.hstack((lp_present.unsqueeze(1), torch.log(1 - psi)))
+        lp_maybe_absent = torch.logsumexp(mal,dim=1)
+        log_prob = definitely_present.view(d1) * lp_present + maybe_absent.view(d1) * lp_maybe_absent
 
-        loss = -torch.mean(log_prob) # loss function
-        loss.backward() # calculate new weights
-        optimizer.step() # updates parameters
+        log_prob = log_prob[no_surveys.view(d1)==False]
+
+
+        loss = -torch.mean(log_prob)
+        loss.backward()
+        optimizer.step()
         running_loss.append(loss.cpu().data.numpy())
+
+# increase size of training data set to reduce error rate
+    # mean loss
+
 plt.plot(np.arange(len(running_loss)), running_loss, c='k')
 plt.xlabel("Number of minibatches")
 plt.ylabel("Negative log-likelihood")
 plt.show()
 
-psi_hat, p_hat = net1(x.to(device),x.to(device))
 
+p = torch.zeros(nsites, nyears, nsurvy).to(device)
+sxy = site_covariates[:, (0, 2)].to(device)
+c1 = torch.range(0,99).unsqueeze(1)
+oxy = obsx_ten[c1.long(),:,:].to(device)
+net_out = net_static(sxy,oxy, p)
 
-plt.scatter(x.numpy(), psi_hat.cpu().detach().numpy(), color='r', alpha=.5)
-plt.plot(x.numpy(), psi.numpy(), color='k')
-plt.title('Occupancy probabilities')
-plt.show()
+psix = net_out[0]
+t1 = torch.Tensor.cpu( psix.view(500,20))
+t1 = t1.mean(0).detach().numpy()
 
-
-plt.scatter(x.numpy(), p_hat.cpu().detach().numpy(), alpha=.5, color='r')
-plt.plot(x.numpy(), p.numpy(), color='k')
-plt.title('Detection probabilities')
-plt.ylim(0, 1)
-
-
-def bbs_nll(xy, model):
-    """ Negative log-likelihood for dynamic occupancy model.
-
-    Args
-    ----
-    xy (tuple): inputs and outputs for the model
-    model (torch.nn.Module): a model object to use.
-
-    Returns
-    -------
-    A tuple of:
-    - logliks (torch.tensor): log likelihoods for each example in a minibatch
-    - out (dict): output from the model, including parameter values
-    """
-    sp_i, gn_i, fm_i, or_i, l1_i, x_i, x_p_i, y_i = xy
-    sp_i = sp_i.to(device)
-    gn_i = gn_i.to(device)
-    fm_i = fm_i.to(device)
-    or_i = or_i.to(device)
-    l1_i = l1_i.to(device)
-    x_i = x_i.to(device)
-    x_p_i = x_p_i.to(device)
-    y_i = y_i.to(device)
-
-    # in cases with no surveys:
-    # - set the survey covariates to zero (this does not contribute to loss)
-    k_i = torch.ones_like(y_i) * 50  # 50 stops
-    no_surveys = y_i != y_i
-    x_p_i[no_surveys] = 0
-    y_i[no_surveys] = 0
-
-    with torch.autograd.detect_anomaly():
-        out = model(sp_i, gn_i, fm_i, or_i, l1_i, x_i, x_p_i)
-        batch_size = y_i.shape[0]
-        num_years = y_i.shape[1]
-
-        lp_y_present = torch.distributions.binomial.Binomial(
-            total_count=k_i, logits=out["logit_p"]
-        ).log_prob(y_i)
-        po = torch.stack(
-            (
-                torch.exp(lp_y_present),
-                (y_i == 0).to(device, dtype=torch.float64),
-            ),
-            -1,
-        )
-
-        # iterate over training examples and replace po with 2x2 identity matrix
-        # when no surveys are conducted
-        po[no_surveys, :] = torch.ones(2).to(device)
-        assert torch.sum(torch.isnan(po)) < 1
-
-        phi_0_i = torch.cat((out["psi0"], 1 - out["psi0"]), -1)
-        Omega = torch.stack(
-            (
-                torch.stack((out["phi"], 1 - out["phi"]), -1),
-                torch.stack((out["gamma"], 1 - out["gamma"]), -1),
-            ),
-            -2,  # stacking along rows (so that rows probs to one)
-        )
-        assert Omega.shape == (batch_size, num_years - 1, 2, 2)
-
-        c = list()
-        # first year: t = 0
-        alpha_raw = torch.bmm(
-            phi_0_i.unsqueeze(1),
-            # batch diag
-            torch.diag_embed(po[:, 0, :], dim1=-2, dim2=-1),
-        )
-        c.append(
-            (
-                    torch.ones(batch_size, 1).to(device)
-                    / torch.sum(alpha_raw, dim=-1)
-            ).squeeze()
-        )
-        alpha = c[-1].view(-1, 1, 1) * alpha_raw
-
-        # subsequent years: t > 0
-        for t in range(num_years - 1):
-            tmp = torch.bmm(
-                Omega[:, t, :, :],
-                # batch diagonal
-                torch.diag_embed(po[:, t + 1, :], dim1=-2, dim2=-1),
-            )
-            alpha_raw = torch.bmm(alpha, tmp)
-            c.append(
-                (
-                        torch.ones(batch_size, 1).to(device)
-                        / torch.sum(alpha_raw, dim=-1)
-                ).squeeze()
-            )
-            alpha = c[-1].view(-1, 1, 1) * alpha_raw
-        c_stacked = torch.stack(c, -1)
-        # log likelihood for each item in the minibatch
-        logliks = -torch.sum(torch.log(c_stacked), dim=-1)
-    return logliks, out
-
+plt.scatter(torch.range(1,20), psis.mean(0).numpy(), color='b')
+plt.scatter(torch.range(1,20), t1, color='r')
+plt.plot(torch.range(1,20), psis.mean(0).numpy(), color='b')
+plt.plot(torch.range(1,20), t1, color='r')
