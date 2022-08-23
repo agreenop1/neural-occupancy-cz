@@ -579,3 +579,189 @@ plt.scatter(torch.range(1,20), psis.mean(0).numpy(), color='b')
 plt.scatter(torch.range(1,20), t1, color='r')
 plt.plot(torch.range(1,20), psis.mean(0).numpy(), color='b')
 plt.plot(torch.range(1,20), t1, color='r')
+
+# define neural network ###################################################################
+#########################################
+nsites = 500
+nyears = 20
+nsurvy = 2
+nobs = nsites * nsurvy * nyears
+k = 20
+
+
+# occupancy transition
+psix = torch.distributions.uniform.Uniform(low=-torch.ones(nyears-1), high=torch.ones(nyears-1)).sample()
+
+# observation covariate
+obsx = torch.distributions.uniform.Uniform(low=-torch.ones(nobs), high=torch.ones(nobs)).sample()
+obsx_ten = obsx.view(nsites,20,2) # site, year, visit
+
+# initial occupancy
+psi0x = torch.distributions.uniform.Uniform(low=-torch.ones(nsites), high=torch.ones(nsites)).sample()
+#x, _ = torch.sort(x) # sort variable from lowest to highest
+
+# put into columns
+psix, obsx, psi0x = psix.unsqueeze(1),obsx.unsqueeze(1),psi0x.unsqueeze(1)
+
+
+
+# create the dataframe
+cv1 = 0.005 # coefficients
+
+# predict persistence
+psi_year = cv1 + -0.9* psix  + 0.09* psix **2
+
+# predict observation model
+py = torch.sigmoid(0.12 + 0.2 * obsx + 0.2 * obsx**2) # observation
+py_arr = py.view(nsites,20,2) # site, year, visit
+
+# predict initial occupancy
+s1 = torch.tensor(4).repeat_interleave(nsites)
+m1 = torch.zeros(nsites)
+error = torch.distributions.normal.Normal(m1,s1).sample()
+psi0y = torch.sigmoid(0.09 + 0.07 * psi0x + 0.07 * psi0x**2 + error.unsqueeze(1)) # occupancy
+
+#########################################
+# predict occupancy for non dynamic model
+zs = torch.zeros((nsites,nyears))
+psis = torch.zeros((nsites,nyears))
+psis[:,0] = psi0y.squeeze()
+zs[:, 0] = torch.distributions.Bernoulli(probs=psis[:, 0]).sample().squeeze()
+for i in range(1,nyears):
+    psis[:,i] = torch.sigmoid(psi_year[i-1,0].squeeze() + torch.logit( psis[:,i-1]))
+    zs[:,i] = torch.distributions.Bernoulli(probs = psis[:,i] ).sample().squeeze()
+
+
+
+# observed p/a
+yobss = torch.zeros((nobs,7))
+
+obs_ys = torch.zeros((nsites,nyears,nsurvy))
+
+# if observation is missing use 0 as the covariate - careful centering!
+
+# observed occupancy
+for j in range(0, nsites):
+    for i in range(0,nyears):
+        for n in range(0,nsurvy):
+            z_ix = torch.distributions.Bernoulli(probs=zs[j,i]*py_arr[j,i,n]).sample()
+            obs_ys[j,i,n] = z_ix
+
+psi_sites_x = psi0x.view(1,nsites,1)
+psi_year_x = psix.repeat(nsites,1).view(500,19,1)
+
+#########################################
+# visualize relationships between covariates and predict variable
+plt.scatter(torch.range(1,20), psis.mean(0).numpy(), color='b')
+plt.plot(torch.range(1,20), psis.mean(0).numpy(), color='b')
+plt.title('Occupancy probabilities')
+plt.show()
+
+device = "cuda:0" #torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# recurrent neural network - time element included but dynamics are not explicitly modeled
+class RNet1(nn.Module):
+
+    n_p_cov = 1
+    n_psi_cov = 1
+    h_dim = 64
+    nyears = 20
+    nvis = 2
+    nsites = nsites
+
+
+    def __init__(self):
+        super(RNet1, self).__init__()
+
+        # one hidden layer
+        self.to_h0 = nn.Linear(self.n_psi_cov, self.h_dim)
+        self.to_hrnn = nn.RNN(input_size = self.n_p_cov,
+                              hidden_size = self.h_dim,
+                              num_layers = 1,
+                              nonlinearity = 'relu',
+                              batch_first = True
+                              )
+
+
+        # component
+        self.to_psi0 = nn.Linear(self.h_dim, 1)
+        self.to_psi = nn.Linear(self.h_dim, 1)
+        self.to_p = nn.Linear(self.h_dim+self.n_p_cov, 1)
+
+    def forward(self,sxy0,sxy,oxy,p,xn ):
+        # neural net
+        h0_out = self.to_h0(sxy0)
+
+
+        # recurrent neural network
+        h_out,h_n = self.to_hrnn(sxy,h0_out.clone())
+
+        # to occupancy
+        psi0_out = torch.sigmoid(self.to_psi0(F.elu(h0_out)))
+        psi_out = torch.sigmoid(self.to_psi(h_out))
+
+
+        # observation
+        for i in range(0, xn):
+
+            hi = h_out[i,:,:].clone()
+            oi = oxy[i,:,:]
+
+            for j in range(0, self.nvis):
+
+                # first year
+                h1 = h0_out[0,i,:].clone()
+                o1 = oi[0,j]
+                t1 = torch.cat((h1, o1.unsqueeze(0)))
+                p[i, 0, j] = torch.sigmoid(self.to_p(t1))
+
+                # the rest of the years
+                tc = torch.hstack((hi,oi[1:,j].unsqueeze(1)))
+                yn = torch.sigmoid(self.to_p(tc))
+                p[i, 1:, j]  = yn.squeeze()
+
+        return psi0_out ,psi_out ,p
+
+# set up test dated to correct network runs properly
+id = xy.squeeze().long().tolist()
+sxy = psi_year_x[id,:,:].to(device)
+sxy.size()
+sxy0 = psi_sites_x[:,id,:].to(device)
+oxy = obsx_ten[id, :, :].to(device)
+xn = oxy.size()[0]
+p = torch.zeros(xn, nyears, nsurvy).to(device)
+
+# neural net
+net_static = RNet1()
+net_static.to(device)
+out=net_static(sxy0,sxy,oxy,p,xn)
+
+############################################################################################
+# send to co
+# res
+running_loss = list()
+
+# currently set up for static model
+optimizer = optim.Adam(net_static.parameters(), weight_decay=1e-8,lr=0.001)
+n_epoch = 100
+
+# needs to put data somewhere
+__file__ = 'C:\\Users\\arrgre\\PycharmProjects\\pythonProject\\neural'
+# 32 samples loaded into train
+# parameters
+params = {'batch_size':32,
+          'shuffle': True,
+          'num_workers': 1}
+
+batch = 32
+site_id = torch.range(0,nsites-1).repeat_interleave(nyears)
+dataset = TensorDataset(site_id.unsqueeze(1))
+dataloader = DataLoader(dataset, **params)
+dataloader
+
+#############################################################################
+# set up for static model
+xy.squeeze().tolist()
+for i in tqdm(range(n_epoch)): # counter
+    for i_batch, xy in enumerate(dataloader):
+        xy = xy[0]
