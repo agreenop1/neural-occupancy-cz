@@ -7,6 +7,6 @@ Second part: occupancy model (latent state) using optimizer.
 
 Third part: Neural network for occupancy model (simple)
 
-Fourth part: Dynamic occupancy model (testing effects of missing data).
+Fourth part: Recurrent neural network occupancy model (testing effects of missing data).
 
 All under development..
