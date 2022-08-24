@@ -582,7 +582,7 @@ plt.plot(torch.range(1,20), t1, color='r')
 
 # define neural network ###################################################################
 #########################################
-nsites = 500
+nsites = 1000
 nyears = 20
 nsurvy = 2
 nobs = nsites * nsurvy * nyears
@@ -608,18 +608,22 @@ psix, obsx, psi0x = psix.unsqueeze(1),obsx.unsqueeze(1),psi0x.unsqueeze(1)
 # create the dataframe
 cv1 = 0.005 # coefficients
 
-# predict persistence
-psi_year = cv1 + -0.9* psix  + 0.09* psix **2
 
 # predict observation model
 py = torch.sigmoid(0.12 + 0.2 * obsx + 0.2 * obsx**2) # observation
 py_arr = py.view(nsites,20,2) # site, year, visit
 
 # predict initial occupancy
-s1 = torch.tensor(0.5).repeat_interleave(nsites)
+s1 = torch.tensor(1).repeat_interleave(nsites)
 m1 = torch.zeros(nsites)
 error = torch.distributions.normal.Normal(m1,s1).sample()
 psi0y = torch.sigmoid(0.09 + 0.07 * psi0x + 0.07 * psi0x**2 + error.unsqueeze(1)) # occupancy
+
+# predict persistence
+s2 = torch.tensor(1).repeat_interleave(nyears-1)
+m2 = torch.zeros(nyears-1)
+error = torch.distributions.normal.Normal(m2,s2).sample()
+psi_year = cv1 + -0.9* psix  + 0.09* psix **2 + error
 
 #########################################
 # predict occupancy for non dynamic model
@@ -648,7 +652,7 @@ for j in range(0, nsites):
             obs_ys[j,i,n] = z_ix
 
 psi_sites_x = psi0x.view(1,nsites,1)
-psi_year_x = psix.repeat(nsites,1).view(500,19,1)
+psi_year_x = psix.repeat(nsites,1).view(nsites,19,1)
 
 #########################################
 # visualize relationships between covariates and predict variable
@@ -751,11 +755,11 @@ n_epoch = 100
 __file__ = 'C:\\Users\\arrgre\\PycharmProjects\\pythonProject\\neural'
 # 32 samples loaded into train
 # parameters
-params = {'batch_size':64,
+params = {'batch_size':128,
           'shuffle': True,
           'num_workers': 3}
 
-batch = 64
+batch = 128
 site_id = torch.range(0,nsites-1).repeat_interleave(nyears)
 dataset = TensorDataset(site_id.unsqueeze(1))
 dataloader = DataLoader(dataset, **params)
@@ -851,7 +855,7 @@ y_i = obs_ys.to(device)  # observed responds
 
 psi0,psi,p = net_static(sxy0,sxy,oxy,p,xn)
 
-psix = net_out[0]
+
 t1 = torch.Tensor.cpu( psi)
 t1 = t1.mean(0).detach().numpy()
 t1.squeeze()
