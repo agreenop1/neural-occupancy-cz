@@ -616,7 +616,7 @@ py = torch.sigmoid(0.12 + 0.2 * obsx + 0.2 * obsx**2) # observation
 py_arr = py.view(nsites,20,2) # site, year, visit
 
 # predict initial occupancy
-s1 = torch.tensor(4).repeat_interleave(nsites)
+s1 = torch.tensor(0.5).repeat_interleave(nsites)
 m1 = torch.zeros(nsites)
 error = torch.distributions.normal.Normal(m1,s1).sample()
 psi0y = torch.sigmoid(0.09 + 0.07 * psi0x + 0.07 * psi0x**2 + error.unsqueeze(1)) # occupancy
@@ -675,6 +675,7 @@ class RNet1(nn.Module):
 
         # one hidden layer
         self.to_h0 = nn.Linear(self.n_psi_cov, self.h_dim)
+        self.to_h1 = nn.Linear(self.h_dim, self.h_dim)
         self.to_hrnn = nn.RNN(input_size = self.n_p_cov,
                               hidden_size = self.h_dim,
                               num_layers = 1,
@@ -690,14 +691,15 @@ class RNet1(nn.Module):
 
     def forward(self,sxy0,sxy,oxy,p,xn ):
         # neural net
-        h0_out = self.to_h0(sxy0)
+        hs_out = F.elu(self.to_h0(sxy0))
+        h0_out = F.elu(self.to_h1(hs_out))
 
 
-        # recurrent neural network
-        h_out,h_n = self.to_hrnn(sxy,h0_out.clone())
+        # recurrent neural netwok
+        h_out,h_n = self.to_hrnn(sxy, h0_out)
 
         # to occupancy
-        psi0_out = torch.sigmoid(self.to_psi0(F.elu(h0_out)))
+        psi0_out = torch.sigmoid(self.to_psi0(h0_out))
         psi_out = torch.sigmoid(self.to_psi(h_out))
 
 
@@ -742,26 +744,141 @@ out=net_static(sxy0,sxy,oxy,p,xn)
 running_loss = list()
 
 # currently set up for static model
-optimizer = optim.Adam(net_static.parameters(), weight_decay=1e-8,lr=0.001)
+optimizer = optim.Adam(net_static.parameters(), weight_decay=1e-8,lr=0.01)
 n_epoch = 100
 
 # needs to put data somewhere
 __file__ = 'C:\\Users\\arrgre\\PycharmProjects\\pythonProject\\neural'
 # 32 samples loaded into train
 # parameters
-params = {'batch_size':32,
+params = {'batch_size':64,
           'shuffle': True,
-          'num_workers': 1}
+          'num_workers': 3}
 
-batch = 32
+batch = 64
 site_id = torch.range(0,nsites-1).repeat_interleave(nyears)
 dataset = TensorDataset(site_id.unsqueeze(1))
 dataloader = DataLoader(dataset, **params)
 dataloader
 
 #############################################################################
-# set up for static model
-xy.squeeze().tolist()
+
 for i in tqdm(range(n_epoch)): # counter
     for i_batch, xy in enumerate(dataloader):
         xy = xy[0]
+        id = xy.squeeze().long().tolist()
+
+        # subset data for example
+        sxy = psi_year_x[id, :, :].to(device)        # site covariates
+        sxy0 = psi_sites_x[:, id, :].to(device) # initial occupancy covariate
+        oxy = obsx_ten[id, :, :].to(device) # observation covariance
+        y_i = obs_ys[id, :, :].to(device) # observed responds
+        y_i.size()
+
+        # test effects of missing data
+        miss = torch.randint(0,19,(2,)).long()
+        y_i[:,miss, 0:2] = float('nan')
+        miss_data = torch.isnan(y_i)
+        no_surveys = torch.Tensor.sum(miss_data, -1) == nsurvy
+        oxy[miss_data] = 0
+        y_i[miss_data] = 0
+
+        optimizer.zero_grad()
+
+        # determine for each example whether we know if z = 1
+        definitely_present = (torch.Tensor.sum(y_i,-1) > 0).to(device, dtype=torch.float32)
+        maybe_absent = (torch.Tensor.sum(y_i,-1) == 0).to(device, dtype=torch.float32)
+
+        # neural net
+        xn = oxy.size()[0]
+        p = torch.zeros(xn,nyears, nsurvy).to(device)
+
+        psi0,psi,p = net_static(sxy0,sxy,oxy,p,xn)
+
+        # list for outputs likelihoods
+        psize = p.size()
+        plik = torch.zeros((xn, nyears, nsurvy))
+        plik = plik.to(device)
+
+        for s in range(0,xn):
+                for k in range(0, nyears):
+                    for j in range(0, nsurvy):
+                        plik[s, k, j] = p[s,k, j] ** y_i[s ,k, j] * ((1 - p[s,k, j]) ** (1 - y_i[s, k, j]))
+
+        plik[miss_data] = 1
+        lp_y_present = torch.log(torch.Tensor.prod(plik, 2))  # log likelihood
+
+        d1 = xn * nyears
+
+        # output log likelihood
+        no_surveys.size()
+        lp_y_present.size()
+
+        # present
+        log_present = torch.zeros((xn, nyears))
+        log_present[:,1 ] = torch.log(psi0[0,:,: ].squeeze()) + lp_y_present[:,1].squeeze()
+        log_present[:,1: ] = torch.log(psi.squeeze()) + lp_y_present[:,1:]
+
+        # maybe absent
+        log_maybe = torch.zeros((xn, nyears,2))
+        log_maybe[:,:,0] =  log_present[:,: ]
+        log_maybe[:, 1, 1] = torch.log(1-psi0[0,:,: ].squeeze())
+        log_maybe[:, 1:, 1] = torch.log(1-psi.squeeze())
+        lp_maybe = torch.logsumexp(log_maybe,dim=2)
+
+        # likelihood
+        log_prob = definitely_present.to(device) * log_present.to(device) + maybe_absent.to(device) * lp_maybe.to(device)
+        log_prob = log_prob.view(d1)[no_surveys.view(d1)==False]
+
+
+        loss = -torch.mean(log_prob)
+        loss.backward()
+        optimizer.step()
+        running_loss.append(loss.cpu().data.numpy())
+
+# increase size of training data set to reduce error rate
+    # mean loss
+
+plt.plot(np.arange(len(running_loss)), running_loss, c='k')
+plt.xlabel("Number of minibatches")
+plt.ylabel("Negative log-likelihood")
+plt.show()
+
+sxy = psi_year_x.to(device)  # site covariates
+sxy0 = psi_sites_x.to(device)  # initial occupancy covariate
+oxy = obsx_ten.to(device)  # observation covariance
+y_i = obs_ys.to(device)  # observed responds
+
+psi0,psi,p = net_static(sxy0,sxy,oxy,p,xn)
+
+psix = net_out[0]
+t1 = torch.Tensor.cpu( psi)
+t1 = t1.mean(0).detach().numpy()
+t1.squeeze()
+
+t2 = torch.Tensor.cpu( psi0)
+t2 = t2.mean(1).detach().numpy()
+t2.squeeze()
+
+plt.scatter(torch.range(1,20), psis.mean(0).numpy(), color='b')
+plt.scatter(1, t2.squeeze(), color='r')
+plt.scatter(torch.range(2,20), t1.squeeze(), color='r')
+plt.plot(torch.range(1,20), psis.mean(0).numpy(), color='b')
+plt.plot(torch.range(2,20), t1.squeeze(), color='r')
+
+o1 = torch.Tensor.cpu( psi0).detach()
+plt.scatter(psi_sites_x.numpy().squeeze(), o1.numpy().squeeze(), color='r')
+plt.scatter(psi_sites_x.numpy().squeeze(), psi0y.squeeze(), color='b')
+
+plt.scatter(psi_year_x[0,0:].squeeze(), t1.squeeze(), color='b')
+plt.scatter(psi_year_x[0,0:].squeeze(), psis[:,1:].mean(0).numpy(), color='r')
+plt.plot(psi_year_x[0,0:].squeeze(), t1.squeeze(), color='r')
+plt.plot(psi_year_x[0,0:].squeeze(), psis[:,1:].mean(0).numpy(), color='r')
+
+
+
+
+
+
+
+
