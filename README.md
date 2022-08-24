@@ -5,8 +5,8 @@ First part: simple logistic regression using optimizer.
 
 Second part: occupancy model (latent state) using optimizer. 
 
-Third part: Neural network for occupancy model (simple)
+Third part: neural network for occupancy model (simple)
 
-Fourth part: Recurrent neural network occupancy model (testing effects of missing data).
+Fourth part: recurrent neural network occupancy model (testing effects of missing data).
 
-All under development..
+All under development...
